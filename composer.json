@@ -1,0 +1,23 @@
+{
+    "name": "mpcmf/mpcmf-exporter",
+    "description": "prometheus exporter",
+    "type": "library",
+    "require": {
+        "mpcmf/mpcmf-core": "dev-master"
+    },
+    "authors": [
+        {
+            "name": "Alex",
+            "email": "thealexsb@gmail.com"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "mpcmf\\system\\": "src/system/"
+        },
+        "files": [
+            "src/loader.php"
+        ]
+    },
+    "minimum-stability": "dev"
+}
