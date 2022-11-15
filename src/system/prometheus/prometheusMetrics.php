@@ -11,37 +11,46 @@ use mpcmf\system\storage\mongoInstance;
 class prometheusMetrics
 {
 
+    protected const CACHE_EXPIRE = 86400;
+
     use log, cache;
-    
-    public static function incrementCounter(string $key, array $labels = [], $counter = 1) 
+
+    public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
         $name = self::formatNameWithLabels($key, $labels);
-        
-        $cv = self::cache()->inc(md5($name), $counter, 0, 86400);
-        if($cv % 100 === 0) {
+
+        $cache = self::cache();
+        $mcKey = self::buildCacheKey($key, $name);
+        $cv = $cache->get($mcKey);
+        if($cv === false) {
+            $cv = $counter;
             self::saveName($key, $name, 'counter');
+        } else {
+            $cv += $counter;
         }
+
+        $cache->set($mcKey, $cv, self::CACHE_EXPIRE);
     }
-    
-    public static function setGauge(string $key, array $labels = [], $value = 0) 
+
+    public static function setGauge(string $key, array $labels = [], $value = 0): void
     {
         $name = self::formatNameWithLabels($key, $labels);
-        
-        $mcKey = md5($name);
-        $bk = self::cache()->getBackend();
-        if($bk->get($mcKey) === false) {
+
+        $mcKey = self::buildCacheKey($key, $name);
+        $cache = self::cache();
+        if($cache->get($mcKey) === false) {
             self::saveName($key, $name, 'gauge');
         }
-        $cv = $bk->set($mcKey, $value, 0, 86400);
+        $cache->set($mcKey, $value, self::CACHE_EXPIRE);
     }
-    
-    protected static function formatNameWithLabels(string $key, array $labels) :string
+
+    protected static function formatNameWithLabels(string $key, array $labels): string
     {
         static $systemData;
         if($systemData === null) {
             $systemData = [
                 'env' => environment::getCurrentEnvironment(),
-                'hostname' => gethostname(), 
+                'hostname' => gethostname(),
             ];
         }
 
@@ -56,22 +65,27 @@ class prometheusMetrics
 
         return "{$key}{{$labelsStr}}";
     }
-    
+
     protected static function saveName(string $key, string $name, string $type): void
     {
         try {
             $newObj = [
                 'key' => $key,
-                'name' => $name, 
-                'type' => $type, 
-                'cache_key' => md5($name)
+                'name' => $name,
+                'type' => $type,
+                'cache_key' => self::buildCacheKey($key, $name)
             ];
             self::coll()->insert($newObj);
         } catch (\MongoDuplicateKeyException $e) {
             //pass
         }
     }
-    
+
+    protected static function buildCacheKey(string $key, string $name): string
+    {
+        return "{$key}_" . md5($name);
+    }
+
     public static function buildMetricsPage() :string
     {
         $cache = self::cache();
@@ -79,7 +93,7 @@ class prometheusMetrics
         foreach (self::coll()->find() as $metric) {
             $cached = $cache->get($metric['cache_key']);
             if($cached === false) {
-                
+
                 continue;
             }
             $value = (float)($cached);
@@ -88,10 +102,10 @@ class prometheusMetrics
 
             $response .= $str;
         }
-        
+
         return $response;
     }
-    
+
     protected static function coll() : \MongoCollection
     {
         static $mongo, $config;
@@ -100,7 +114,7 @@ class prometheusMetrics
             $config = config::getConfig(__CLASS__);
             $mongo->checkIndicesAuto($config);
         }
-        
+
         return $mongo->getCollection($config['db'], $config['collection']);
     }
 }
