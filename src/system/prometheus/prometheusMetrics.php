@@ -11,19 +11,27 @@ use mpcmf\system\storage\mongoInstance;
 class prometheusMetrics
 {
 
+    protected const CACHE_EXPIRE = 86400;
+
     use log, cache;
     
-    public static function incrementCounter(string $key, array $labels = [], $counter = 1) 
+    public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
         $name = self::formatNameWithLabels($key, $labels);
         
-        $cv = self::cache()->inc(md5($name), $counter, 0, 86400);
-        if($cv % 100 === 0) {
+        $bk = self::cache()->getBackend();
+        $mcKey = md5($name);
+        $cv = $bk->get($mcKey);
+        if($cv === false) {
+            $cv = $counter;
             self::saveName($key, $name, 'counter');
+        } else {
+            $cv += $counter;
         }
+        $bk->set($mcKey, $cv, self::CACHE_EXPIRE);
     }
     
-    public static function setGauge(string $key, array $labels = [], $value = 0) 
+    public static function setGauge(string $key, array $labels = [], $value = 0): void
     {
         $name = self::formatNameWithLabels($key, $labels);
         
@@ -32,7 +40,7 @@ class prometheusMetrics
         if($bk->get($mcKey) === false) {
             self::saveName($key, $name, 'gauge');
         }
-        $cv = $bk->set($mcKey, $value, 0, 86400);
+        $bk->set($mcKey, $value, self::CACHE_EXPIRE);
     }
     
     protected static function formatNameWithLabels(string $key, array $labels) :string
