@@ -17,10 +17,10 @@ class prometheusMetrics
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
-        $name = self::formatNameWzithLabels($key, $labels);
+        $name = self::formatNameWithLabels($key, $labels);
 
         $cache = self::cache();
-        $mcKey = self::getCacheKeyByName($name);
+        $mcKey = self::buildCacheKey($key, $name);
         $cv = $cache->get($mcKey);
         if($cv === false) {
             $cv = $counter;
@@ -36,7 +36,7 @@ class prometheusMetrics
     {
         $name = self::formatNameWithLabels($key, $labels);
 
-        $mcKey = self::getCacheKeyByName($name);
+        $mcKey = self::buildCacheKey($key, $name);
         $cache = self::cache();
         if($cache->get($mcKey) === false) {
             self::saveName($key, $name, 'gauge');
@@ -73,7 +73,7 @@ class prometheusMetrics
                 'key' => $key,
                 'name' => $name,
                 'type' => $type,
-                'cache_key' => self::getCacheKeyByName($name)
+                'cache_key' => self::buildCacheKey($key, $name)
             ];
             self::coll()->insert($newObj);
         } catch (\MongoDuplicateKeyException $e) {
@@ -81,9 +81,9 @@ class prometheusMetrics
         }
     }
 
-    protected static function getCacheKeyByName(string $name): string
+    protected static function buildCacheKey(string $key, string $name): string
     {
-        return md5($name);
+        return "{$key}_" . md5($name);
     }
 
     public static function buildMetricsPage() :string
