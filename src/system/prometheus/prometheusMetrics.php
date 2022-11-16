@@ -86,10 +86,11 @@ class prometheusMetrics
         return "{$key}_" . md5($name);
     }
 
-    public static function buildMetricsPage() :string
+    public static function buildMetricsPage(): string
     {
         $cache = self::cache();
         $response = '';
+        $metricGrouped = [];
         foreach (self::coll()->find() as $metric) {
             $cached = $cache->get($metric['cache_key']);
             if($cached === false) {
@@ -97,10 +98,12 @@ class prometheusMetrics
                 continue;
             }
             $value = (float)($cached);
-            $str = "# TYPE {$metric['key']} {$metric['type']}\n";
-            $str .= "{$metric['name']} {$value}\n";
+            $groupKey = "#TYPE {$metric['key']} {$metric['type']}";
+            $metricGrouped[$groupKey][] = "{$metric['name']} {$value}";
+        }
 
-            $response .= $str;
+        foreach ($metricGrouped as $groupKey => $metrics) {
+            $response .= $groupKey . "\n" . implode("\n", $metrics) . "\n";
         }
 
         return $response;
