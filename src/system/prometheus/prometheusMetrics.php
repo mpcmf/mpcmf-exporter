@@ -50,7 +50,6 @@ class prometheusMetrics
         if($systemData === null) {
             $systemData = [
                 'env' => environment::getCurrentEnvironment(),
-                'hostname' => gethostname(),
             ];
         }
 
