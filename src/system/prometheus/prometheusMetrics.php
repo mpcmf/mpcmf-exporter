@@ -89,20 +89,25 @@ class prometheusMetrics
     {
         $cache = self::cache();
         $response = '';
-        $metricGrouped = [];
+        $metrics = [];
         foreach (self::coll()->find() as $metric) {
-            $cached = $cache->get($metric['cache_key']);
-            if($cached === false) {
+            $metrics[$metric['cache_key']] = $metric;
+        }
+        $cached = $cache->getBackend()->getMulti(array_keys($metrics));
+        if(!is_array($cached)) {
 
-                continue;
-            }
-            $value = (float)($cached);
-            $groupKey = "#TYPE {$metric['key']} {$metric['type']}";
-            $metricGrouped[$groupKey][] = "{$metric['name']} {$value}";
+            return $response;
         }
 
-        foreach ($metricGrouped as $groupKey => $metrics) {
-            $response .= $groupKey . "\n" . implode("\n", $metrics) . "\n";
+        $metricGrouped = [];
+        foreach ($cached as $key => $value) {
+            $value = (float)($value);
+            $groupKey = "#TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
+            $metricGrouped[$groupKey][] = "{$metrics[$key]['name']} {$value}";
+        }
+
+        foreach ($metricGrouped as $groupKey => $groupMetrics) {
+            $response .= $groupKey . "\n" . implode("\n", $groupMetrics) . "\n";
         }
 
         return $response;
