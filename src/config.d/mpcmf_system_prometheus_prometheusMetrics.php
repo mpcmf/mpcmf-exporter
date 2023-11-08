@@ -1,17 +1,23 @@
 <?php
 
 \mpcmf\system\configuration\config::setConfig(__FILE__, [
-    'db' => 'prometheus',
-    'collection' => 'metrics',
-    'indices' => [
-        [
-            'keys' => [
-                'cache_key' => 1,
-            ],
-            'options' => [
-                'unique' => true
+    'storage' => [
+        'configSection' => 'default',
+        'db' => 'prometheus',
+        'collection' => 'metrics',
+        'indices' => [
+            [
+                'keys' => [
+                    'cache_key' => 1,
+                ],
+                'options' => [
+                    'unique' => true
+                ]
             ]
-        ]
+        ],
     ],
+    'cache' => [
+        'configSection' => 'default'
+    ]
 ]);
 

@@ -2,9 +2,9 @@
 
 namespace mpcmf\system\prometheus;
 
+use mpcmf\system\cache\memcached;
 use mpcmf\system\configuration\config;
 use mpcmf\system\configuration\environment;
-use mpcmf\system\helper\cache\cache;
 use mpcmf\system\helper\io\log;
 use mpcmf\system\storage\mongoInstance;
 
@@ -13,7 +13,7 @@ class prometheusMetrics
 
     protected const CACHE_EXPIRE = 86400;
 
-    use log, cache;
+    use log;
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
@@ -113,15 +113,26 @@ class prometheusMetrics
         return $response;
     }
 
-    protected static function coll() : \MongoCollection
+    protected static function coll(): \MongoCollection
     {
         static $mongo, $config;
         if ($mongo === null) {
-            $mongo = mongoInstance::factory();
-            $config = config::getConfig(__CLASS__);
+            $config = config::getConfig(__CLASS__)['storage'];
+            $mongo = mongoInstance::factory($config['configSection']);
             $mongo->checkIndicesAuto($config);
         }
 
         return $mongo->getCollection($config['db'], $config['collection']);
+    }
+
+    protected static function cache(): memcached
+    {
+        static $cache;
+        if ($cache === null) {
+            $section = config::getConfig(__CLASS__)['cache']['configSection'];
+            $cache = memcached::factory($section);
+        }
+
+        return $cache;
     }
 }
