@@ -44,6 +44,26 @@ class prometheusMetrics
         $cache->set($mcKey, $value, self::CACHE_EXPIRE);
     }
 
+    public static function incrementHistogram(string $name, array $labels, array $buckets, int $value): void
+    {
+        $bucketName = "{$name}_bucket";
+        $totalSumName = "{$name}_sum";
+        $totalCountName = "{$name}_count";
+
+        $labelsBucket = $labels;
+        $activeBucket = '+Inf';
+        foreach ($buckets as $bucket) {
+            if($value < $bucket) {
+                $activeBucket = $bucket;
+                break;
+            }
+        }
+        $labelsBucket['le'] = $activeBucket;
+        self::incrementCounter($bucketName, $labelsBucket, 1);
+        self::incrementCounter($totalCountName, $labels, 1);
+        self::incrementCounter($totalSumName, $labels, $value);
+    }
+
     protected static function formatNameWithLabels(string $key, array $labels): string
     {
         static $systemData;
