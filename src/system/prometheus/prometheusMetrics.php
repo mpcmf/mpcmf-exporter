@@ -32,6 +32,34 @@ class prometheusMetrics
         $cache->set($mcKey, $cv, self::CACHE_EXPIRE);
     }
 
+    public static function incrementCounterCached(string $key, array $labels = [], $counter = 1, $incrementAfter = 10): void
+    {
+        static $cached = [];
+        $name = self::formatNameWithLabels($key, $labels);
+
+        $cache = self::cache();
+        $mcKey = self::buildCacheKey($key, $name);
+        if(!isset($cached[$mcKey])) {
+            $cached[$mcKey] = 0;
+        }
+        $cached[$mcKey] += $counter;
+        if($cached[$mcKey] < $incrementAfter) {
+            return;
+        }
+        $counter = $cached[$mcKey];
+        $cached[$mcKey] = 0;
+
+        $cv = $cache->get($mcKey);
+        if($cv === false) {
+            $cv = $counter;
+            self::saveName($key, $name, 'counter');
+        } else {
+            $cv += $counter;
+        }
+
+        $cache->set($mcKey, $cv, self::CACHE_EXPIRE);
+    }
+
     public static function setGauge(string $key, array $labels = [], $value = 0): void
     {
         $name = self::formatNameWithLabels($key, $labels);
