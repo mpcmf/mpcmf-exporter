@@ -141,8 +141,19 @@ class prometheusMetrics
         foreach (self::coll()->find() as $metric) {
             $metrics[$metric['cache_key']] = $metric;
         }
-        $cached = $cache->getBackend()->getMulti(array_keys($metrics));
-        if(!is_array($cached)) {
+
+        $cached = [];
+        $chunked = array_chunk(array_keys($metrics), 5000, true);
+        foreach ($chunked as $chunk) {
+            $cachedChunk = $cache->getBackend()->getMulti($chunk);
+            if (!is_array($cachedChunk)) {
+                continue;
+            }
+            $cached = array_merge($cached, $cachedChunk);
+        }
+        unset($chunked, $chunk, $cachedChunk);
+
+        if(empty($cached)) {
 
             return $response;
         }
