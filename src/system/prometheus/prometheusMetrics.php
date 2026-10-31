@@ -81,24 +81,106 @@ class prometheusMetrics
         $cache->set($mcKey, $value, self::CACHE_EXPIRE);
     }
 
-    public static function incrementHistogram(string $name, array $labels, array $buckets, int $value): void
+    /**
+     * Observe a value: one write to its bucket (le is inclusive), plus _count and _sum.
+     * Buckets are made cumulative in buildMetricsPage().
+     *
+     * @param int|float $value
+     */
+    public static function incrementHistogram(string $name, array $labels, array $buckets, $value): void
     {
-        $bucketName = "{$name}_bucket";
-        $totalSumName = "{$name}_sum";
-        $totalCountName = "{$name}_count";
+        $countName = self::buildSeriesName("{$name}_count", $labels);
+        if ($countName === null) {
+            return;
+        }
+        if (array_key_exists('le', $labels)) {
+            self::logInvalid("histogram {$name}: label le is reserved");
 
-        $labelsBucket = $labels;
+            return;
+        }
+        $sumDelta = self::toFixedPoint($name, $value);
+        $buckets = self::normalizeBuckets($name, $buckets);
+        if ($sumDelta === null || $buckets === null) {
+            return;
+        }
+
         $activeBucket = '+Inf';
         foreach ($buckets as $bucket) {
-            if($value < $bucket) {
-                $activeBucket = $bucket;
+            if ($value <= $bucket) {
+                $activeBucket = self::formatValue($bucket);
                 break;
             }
         }
-        $labelsBucket['le'] = $activeBucket;
-        self::incrementCounter($bucketName, $labelsBucket, 1);
-        self::incrementCounter($totalCountName, $labels, 1);
-        self::incrementCounter($totalSumName, $labels, $value);
+
+        $expire = self::counterExpire($name);
+        $countKey = self::buildCacheKey("{$name}_count", $countName);
+        if (self::atomicIncrement($countKey, self::VALUE_SCALE, $expire) === true) {
+            self::registerHistogram($name, $labels, $buckets, $countKey);
+        }
+
+        $bucketLabels = $labels;
+        $bucketLabels['le'] = $activeBucket;
+        $bucketName = self::formatNameWithLabels("{$name}_bucket", $bucketLabels);
+        if (self::atomicIncrement(self::buildCacheKey("{$name}_bucket", $bucketName), self::VALUE_SCALE, $expire) === true) {
+            // covers buckets added to an existing histogram
+            self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $activeBucket);
+        }
+
+        $sumName = self::formatNameWithLabels("{$name}_sum", $labels);
+        self::atomicIncrement(self::buildCacheKey("{$name}_sum", $sumName), $sumDelta, $expire);
+    }
+
+    /**
+     * @return array|null bucket bounds sorted ascending, without +Inf
+     */
+    protected static function normalizeBuckets(string $name, array $buckets): ?array
+    {
+        $result = [];
+        foreach ($buckets as $bucket) {
+            if (!is_numeric($bucket) || is_nan((float)$bucket)) {
+                self::logInvalid("histogram {$name}: bucket bounds must be numbers");
+
+                return null;
+            }
+            $bucket += 0;
+            if (!is_infinite((float)$bucket)) {
+                $result[self::formatValue($bucket)] = $bucket;
+            }
+        }
+        usort($result, static function ($a, $b) {
+            return $a <=> $b;
+        });
+
+        return $result;
+    }
+
+    /**
+     * Register every bucket of a new series, so unobserved buckets are exposed as well.
+     */
+    protected static function registerHistogram(string $name, array $labels, array $buckets, string $countKey): void
+    {
+        $bounds = [];
+        foreach ($buckets as $bucket) {
+            $bounds[] = self::formatValue($bucket);
+        }
+        $bounds[] = '+Inf';
+        foreach ($bounds as $le) {
+            $bucketLabels = $labels;
+            $bucketLabels['le'] = $le;
+            self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $le);
+        }
+        self::saveHistogramPart($name, 'sum', $labels, $countKey);
+        self::saveHistogramPart($name, 'count', $labels, $countKey);
+    }
+
+    protected static function saveHistogramPart(string $name, string $part, array $labels, string $countKey, ?string $le = null): void
+    {
+        $key = "{$name}_{$part}";
+        $extra = ['family' => $name, 'part' => $part, 'group' => $countKey];
+        if ($le !== null) {
+            $extra['le'] = $le;
+        }
+        self::saveName($key, self::formatNameWithLabels($key, $labels), 'histogram', $extra);
     }
 
     /**
@@ -300,19 +382,99 @@ class prometheusMetrics
             return $response;
         }
 
-        $metricGrouped = [];
-        foreach ($cached as $key => $value) {
-            $scale = (int)($metrics[$key]['scale'] ?? 1);
-            $value = $scale > 1 && is_int($value) ? self::formatFixedPoint($value, $scale) : self::formatValue($value);
-            $groupKey = "# TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
-            $metricGrouped[$groupKey][] = "{$metrics[$key]['name']} {$value}";
+        $families = [];
+        $histograms = [];
+        foreach ($metrics as $cacheKey => $metric) {
+            if ($metric['type'] === 'histogram') {
+                $histograms[$metric['family']][$metric['group']][] = $metric;
+                continue;
+            }
+            if (array_key_exists($cacheKey, $cached)) {
+                $line = $metric['name'] . ' ' . self::formatStoredValue($cached[$cacheKey], $metric);
+                self::addFamilyLines($families, $metric['key'], $metric['type'], [$line]);
+            }
         }
+        foreach ($histograms as $family => $groups) {
+            foreach ($groups as $countKey => $parts) {
+                // _count expired: the whole series restarts, buckets must not outlive it
+                if (!array_key_exists($countKey, $cached)) {
+                    continue;
+                }
+                self::addFamilyLines($families, $family, 'histogram', self::buildHistogramLines($parts, $cached));
+            }
+        }
+        ksort($families, SORT_STRING);
 
-        foreach ($metricGrouped as $groupKey => $groupMetrics) {
-            $response .= $groupKey . "\n" . implode("\n", $groupMetrics) . "\n";
+        foreach ($families as $family => $data) {
+            $response .= "# TYPE {$family} {$data['type']}\n" . implode("\n", $data['lines']) . "\n";
         }
 
         return $response;
+    }
+
+    /**
+     * Cumulative buckets sorted by le, +Inf equal to _count, then _sum and _count.
+     */
+    protected static function buildHistogramLines(array $parts, array $cached): array
+    {
+        $buckets = [];
+        $infName = $sumLine = $countLine = $count = null;
+        foreach ($parts as $part) {
+            $value = $cached[$part['cache_key']] ?? 0;
+            if ($part['part'] === 'count') {
+                $count = self::formatStoredValue($value, $part);
+                $countLine = $part['name'];
+            } elseif ($part['part'] === 'sum') {
+                $sumLine = $part['name'] . ' ' . self::formatStoredValue($value, $part);
+            } elseif ($part['le'] === '+Inf') {
+                $infName = $part['name'];
+            } else {
+                $buckets[] = [(float)$part['le'], $part['name'], (int)$value, (int)($part['scale'] ?? 1)];
+            }
+        }
+        usort($buckets, static function ($a, $b) {
+            return $a[0] <=> $b[0];
+        });
+
+        $lines = [];
+        $cumulative = 0;
+        foreach ($buckets as [$le, $name, $value, $scale]) {
+            $cumulative += $value;
+            $lines[] = "{$name} " . self::formatFixedPoint($cumulative, $scale);
+        }
+        if ($infName !== null) {
+            $lines[] = "{$infName} {$count}";
+        }
+        if ($sumLine !== null) {
+            $lines[] = $sumLine;
+        }
+        if ($countLine !== null) {
+            $lines[] = "{$countLine} {$count}";
+        }
+
+        return $lines;
+    }
+
+    protected static function addFamilyLines(array &$families, string $family, string $type, array $lines): void
+    {
+        if (!isset($families[$family])) {
+            $families[$family] = ['type' => $type, 'lines' => []];
+        } elseif ($families[$family]['type'] !== $type) {
+            self::logInvalid("metric {$family} is registered as both {$families[$family]['type']} and {$type}");
+
+            return;
+        }
+        array_push($families[$family]['lines'], ...$lines);
+    }
+
+    /**
+     * @param mixed $value
+     */
+    protected static function formatStoredValue($value, $metric): string
+    {
+        $scale = (int)($metric['scale'] ?? 1);
+
+        return $scale > 1 && is_int($value) ? self::formatFixedPoint($value, $scale) : self::formatValue($value);
     }
 
     protected static function formatFixedPoint(int $value, int $scale): string
