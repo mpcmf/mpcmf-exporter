@@ -161,12 +161,12 @@ class prometheusMetrics
             ];
         }
 
+        // label order must not produce a different series
+        $labels = array_replace($systemData, $labels);
+        ksort($labels, SORT_STRING);
         $labelData = [];
-        foreach ($systemData as $label => $labelValue) {
-            $labelData[$label] = "{$label}=\"" . self::escapeLabelValue((string)$labelValue) . '"';
-        }
         foreach ($labels as $label => $labelValue) {
-            $labelData[$label] = "{$label}=\"" . self::escapeLabelValue((string)$labelValue) . '"';
+            $labelData[] = "{$label}=\"" . self::escapeLabelValue((string)$labelValue) . '"';
         }
         $labelsStr = implode(', ', $labelData);
 
