@@ -32,7 +32,18 @@ class prometheusMetrics
 
     protected const LABEL_NAME_REGEX = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
 
+    /** Max age of values buffered by incrementCounterCached(), seconds */
+    protected const CACHED_FLUSH_INTERVAL = 10;
+
     use log;
+
+    /** @var array series cache key => [metric, series name, buffered value] */
+    protected static $cachedCounters = [];
+
+    /** @var int|null pid that owns $cachedCounters */
+    protected static $cachedCountersPid;
+
+    protected static $cachedCountersFlushedAt = 0;
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
@@ -44,26 +55,67 @@ class prometheusMetrics
         self::addToCounter($key, $name, $counter);
     }
 
+    /**
+     * Buffer increments in the process and write them once the buffered value reaches $incrementAfter,
+     * at least every CACHED_FLUSH_INTERVAL seconds (checked on the next call) and at process shutdown.
+     */
     public static function incrementCounterCached(string $key, array $labels = [], $counter = 1, $incrementAfter = 10): void
     {
-        static $cached = [];
         $name = self::buildSeriesName($key, $labels);
         if ($name === null) {
             return;
         }
+        self::resetCachedCountersAfterFork();
 
         $mcKey = self::buildCacheKey($key, $name);
-        if(!isset($cached[$mcKey])) {
-            $cached[$mcKey] = 0;
+        if (!isset(self::$cachedCounters[$mcKey])) {
+            self::$cachedCounters[$mcKey] = [$key, $name, 0];
         }
-        $cached[$mcKey] += $counter;
-        if($cached[$mcKey] < $incrementAfter) {
+        self::$cachedCounters[$mcKey][2] += $counter;
+        if (self::$cachedCounters[$mcKey][2] >= $incrementAfter) {
+            $value = self::$cachedCounters[$mcKey][2];
+            unset(self::$cachedCounters[$mcKey]);
+            self::addToCounter($key, $name, $value);
+        }
+        if (time() - self::$cachedCountersFlushedAt >= self::CACHED_FLUSH_INTERVAL) {
+            self::flushCachedCounters();
+        }
+    }
+
+    /**
+     * Write all values buffered by incrementCounterCached(); also runs at process shutdown.
+     */
+    public static function flushCachedCounters(): void
+    {
+        self::resetCachedCountersAfterFork();
+        $counters = self::$cachedCounters;
+        self::$cachedCounters = [];
+        self::$cachedCountersFlushedAt = time();
+        foreach ($counters as [$key, $name, $value]) {
+            self::addToCounter($key, $name, $value);
+        }
+    }
+
+    protected static function resetCachedCountersAfterFork(): void
+    {
+        $pid = getmypid();
+        if (self::$cachedCountersPid === $pid) {
             return;
         }
-        $counter = $cached[$mcKey];
-        $cached[$mcKey] = 0;
-
-        self::addToCounter($key, $name, $counter);
+        // a forked child must not write what its parent buffered: the parent flushes it itself
+        self::$cachedCounters = [];
+        self::$cachedCountersFlushedAt = time();
+        if (self::$cachedCountersPid === null) {
+            // inherited by forked children, where it flushes only their own values
+            register_shutdown_function(static function () {
+                try {
+                    self::flushCachedCounters();
+                } catch (\Throwable $e) {
+                    self::log()->addError('[prometheusMetrics] flush of cached counters failed: ' . $e->getMessage());
+                }
+            });
+        }
+        self::$cachedCountersPid = $pid;
     }
 
     public static function setGauge(string $key, array $labels = [], $value = 0): void
