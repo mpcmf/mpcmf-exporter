@@ -13,11 +13,18 @@ class prometheusMetrics
 
     protected const CACHE_EXPIRE = 86400;
 
+    protected const METRIC_NAME_REGEX = '/^[a-zA-Z_:][a-zA-Z0-9_:]*$/D';
+
+    protected const LABEL_NAME_REGEX = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
+
     use log;
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
-        $name = self::formatNameWithLabels($key, $labels);
+        $name = self::buildSeriesName($key, $labels);
+        if ($name === null) {
+            return;
+        }
 
         $cache = self::cache();
         $mcKey = self::buildCacheKey($key, $name);
@@ -35,7 +42,10 @@ class prometheusMetrics
     public static function incrementCounterCached(string $key, array $labels = [], $counter = 1, $incrementAfter = 10): void
     {
         static $cached = [];
-        $name = self::formatNameWithLabels($key, $labels);
+        $name = self::buildSeriesName($key, $labels);
+        if ($name === null) {
+            return;
+        }
 
         $cache = self::cache();
         $mcKey = self::buildCacheKey($key, $name);
@@ -62,7 +72,10 @@ class prometheusMetrics
 
     public static function setGauge(string $key, array $labels = [], $value = 0): void
     {
-        $name = self::formatNameWithLabels($key, $labels);
+        $name = self::buildSeriesName($key, $labels);
+        if ($name === null) {
+            return;
+        }
 
         $mcKey = self::buildCacheKey($key, $name);
         $cache = self::cache();
@@ -92,6 +105,53 @@ class prometheusMetrics
         self::incrementCounter($totalSumName, $labels, $value);
     }
 
+    /**
+     * Validate the metric and label names and build the series name.
+     * Returns null (and logs) when the series cannot be exposed: one bad line breaks the whole scrape.
+     */
+    protected static function buildSeriesName(string $key, array $labels): ?string
+    {
+        if (!preg_match(self::METRIC_NAME_REGEX, $key)) {
+            self::logInvalid("invalid metric name '{$key}'");
+
+            return null;
+        }
+        foreach ($labels as $label => $labelValue) {
+            if (!preg_match(self::LABEL_NAME_REGEX, (string)$label)) {
+                self::logInvalid("metric {$key}: invalid label name '{$label}'");
+
+                return null;
+            }
+            if ($labelValue !== null && !is_scalar($labelValue) && !(is_object($labelValue) && method_exists($labelValue, '__toString'))) {
+                self::logInvalid("metric {$key}: value of label {$label} is not a string");
+
+                return null;
+            }
+            if (!preg_match('//u', (string)$labelValue)) {
+                self::logInvalid("metric {$key}: value of label {$label} is not valid UTF-8");
+
+                return null;
+            }
+        }
+
+        return self::formatNameWithLabels($key, $labels);
+    }
+
+    protected static function logInvalid(string $message): void
+    {
+        static $logged = [];
+        if (isset($logged[$message]) || count($logged) >= 1000) {
+            return;
+        }
+        $logged[$message] = true;
+        self::log()->addWarning("[prometheusMetrics] {$message}, metric skipped");
+    }
+
+    protected static function escapeLabelValue(string $value): string
+    {
+        return strtr($value, ['\\' => '\\\\', '"' => '\\"', "\n" => '\\n']);
+    }
+
     protected static function formatNameWithLabels(string $key, array $labels): string
     {
         static $systemData;
@@ -103,10 +163,10 @@ class prometheusMetrics
 
         $labelData = [];
         foreach ($systemData as $label => $labelValue) {
-            $labelData[$label] = "{$label}=\"{$labelValue}\"";
+            $labelData[$label] = "{$label}=\"" . self::escapeLabelValue((string)$labelValue) . '"';
         }
         foreach ($labels as $label => $labelValue) {
-            $labelData[$label] = "{$label}=\"{$labelValue}\"";
+            $labelData[$label] = "{$label}=\"" . self::escapeLabelValue((string)$labelValue) . '"';
         }
         $labelsStr = implode(', ', $labelData);
 
