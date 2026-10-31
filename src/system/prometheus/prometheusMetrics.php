@@ -11,7 +11,22 @@ use mpcmf\system\storage\mongoInstance;
 class prometheusMetrics
 {
 
+    /** TTL of gauges, refreshed by every setGauge() */
     protected const CACHE_EXPIRE = 86400;
+
+    /**
+     * Lifetime of counter keys (30 days, the largest relative memcached TTL).
+     * increment() does not extend the TTL, so a counter restarts from zero once per period.
+     */
+    protected const COUNTER_EXPIRE = 2592000;
+
+    /** Counters are stored as integers in millionths: increment() accepts integers only */
+    protected const VALUE_SCALE = 1000000;
+
+    /** Key prefix and registry version of the integer storage format; older float keys are left to expire */
+    protected const KEY_PREFIX = 'v2:';
+
+    protected const FORMAT_VERSION = 2;
 
     protected const METRIC_NAME_REGEX = '/^[a-zA-Z_:][a-zA-Z0-9_:]*$/D';
 
@@ -26,17 +41,7 @@ class prometheusMetrics
             return;
         }
 
-        $cache = self::cache();
-        $mcKey = self::buildCacheKey($key, $name);
-        $cv = $cache->get($mcKey);
-        if($cv === false) {
-            $cv = $counter;
-            self::saveName($key, $name, 'counter');
-        } else {
-            $cv += $counter;
-        }
-
-        $cache->set($mcKey, $cv, self::CACHE_EXPIRE);
+        self::addToCounter($key, $name, $counter);
     }
 
     public static function incrementCounterCached(string $key, array $labels = [], $counter = 1, $incrementAfter = 10): void
@@ -47,7 +52,6 @@ class prometheusMetrics
             return;
         }
 
-        $cache = self::cache();
         $mcKey = self::buildCacheKey($key, $name);
         if(!isset($cached[$mcKey])) {
             $cached[$mcKey] = 0;
@@ -59,15 +63,7 @@ class prometheusMetrics
         $counter = $cached[$mcKey];
         $cached[$mcKey] = 0;
 
-        $cv = $cache->get($mcKey);
-        if($cv === false) {
-            $cv = $counter;
-            self::saveName($key, $name, 'counter');
-        } else {
-            $cv += $counter;
-        }
-
-        $cache->set($mcKey, $cv, self::CACHE_EXPIRE);
+        self::addToCounter($key, $name, $counter);
     }
 
     public static function setGauge(string $key, array $labels = [], $value = 0): void
@@ -103,6 +99,90 @@ class prometheusMetrics
         self::incrementCounter($bucketName, $labelsBucket, 1);
         self::incrementCounter($totalCountName, $labels, 1);
         self::incrementCounter($totalSumName, $labels, $value);
+    }
+
+    /**
+     * @param int|float $counter
+     */
+    protected static function addToCounter(string $key, string $name, $counter): void
+    {
+        $delta = self::toFixedPoint($key, $counter);
+        if ($delta === null) {
+            return;
+        }
+        if (self::atomicIncrement(self::buildCacheKey($key, $name), $delta, self::counterExpire($key)) === true) {
+            self::saveName($key, $name, 'counter');
+        }
+    }
+
+    /**
+     * @param mixed $value
+     */
+    protected static function toFixedPoint(string $key, $value): ?int
+    {
+        if (!is_numeric($value) || !is_finite((float)$value) || $value < 0 || $value * self::VALUE_SCALE >= PHP_INT_MAX) {
+            self::logInvalid("metric {$key}: increment must be a finite non-negative number");
+
+            return null;
+        }
+
+        return (int)round($value * self::VALUE_SCALE);
+    }
+
+    /**
+     * Add $delta to an integer key: increment(), or add() + increment() when the key is missing.
+     * CAS is not used on purpose: memcached-protocol backends such as dragonfly do not support it.
+     *
+     * @return bool|null true if this call created the key, false if the key existed, null on error
+     */
+    protected static function atomicIncrement(string $mcKey, int $delta, int $expire): ?bool
+    {
+        $memcached = self::cache()->getBackend();
+        if ($memcached->increment($mcKey, $delta) !== false) {
+            return false;
+        }
+        // false is "not found" only with RES_NOTFOUND; anything else is a backend error
+        if ($memcached->getResultCode() !== \Memcached::RES_NOTFOUND) {
+            self::logBackendError("increment {$mcKey}: {$memcached->getResultMessage()}");
+
+            return null;
+        }
+        $created = $memcached->add($mcKey, 0, $expire);
+        if (!$created && $memcached->getResultCode() !== \Memcached::RES_NOTSTORED) {
+            self::logBackendError("add {$mcKey}: {$memcached->getResultMessage()}");
+
+            return null;
+        }
+        if ($memcached->increment($mcKey, $delta) === false) {
+            self::logBackendError("increment {$mcKey}: {$memcached->getResultMessage()}");
+
+            return $created ?: null;
+        }
+
+        return $created;
+    }
+
+    /**
+     * All keys of one metric expire at the same moment (the phase depends on the metric name),
+     * so histogram buckets, _sum and _count always restart together.
+     */
+    protected static function counterExpire(string $family): int
+    {
+        return self::COUNTER_EXPIRE - (time() + crc32($family)) % self::COUNTER_EXPIRE;
+    }
+
+    protected static function logBackendError(string $message): void
+    {
+        static $lastLogged = 0, $suppressed = 0;
+        if (time() - $lastLogged < 60) {
+            $suppressed++;
+
+            return;
+        }
+        $suffix = $suppressed > 0 ? " ({$suppressed} more errors suppressed)" : '';
+        self::log()->addError("[prometheusMetrics] {$message}{$suffix}");
+        $lastLogged = time();
+        $suppressed = 0;
     }
 
     /**
@@ -173,15 +253,17 @@ class prometheusMetrics
         return "{$key}{{$labelsStr}}";
     }
 
-    protected static function saveName(string $key, string $name, string $type): void
+    protected static function saveName(string $key, string $name, string $type, array $extra = []): void
     {
         try {
             $newObj = [
                 'key' => $key,
                 'name' => $name,
                 'type' => $type,
-                'cache_key' => self::buildCacheKey($key, $name)
-            ];
+                'cache_key' => self::buildCacheKey($key, $name),
+                'version' => self::FORMAT_VERSION,
+                'scale' => $type === 'gauge' ? 1 : self::VALUE_SCALE,
+            ] + $extra;
             self::coll()->insert($newObj);
         } catch (\MongoDuplicateKeyException $e) {
             //pass
@@ -190,7 +272,7 @@ class prometheusMetrics
 
     protected static function buildCacheKey(string $key, string $name): string
     {
-        return "{$key}_" . md5($name);
+        return self::KEY_PREFIX . "{$key}_" . md5($name);
     }
 
     public static function buildMetricsPage(): string
@@ -198,7 +280,7 @@ class prometheusMetrics
         $cache = self::cache();
         $response = '';
         $metrics = [];
-        foreach (self::coll()->find() as $metric) {
+        foreach (self::coll()->find(['version' => self::FORMAT_VERSION]) as $metric) {
             $metrics[$metric['cache_key']] = $metric;
         }
 
@@ -220,7 +302,8 @@ class prometheusMetrics
 
         $metricGrouped = [];
         foreach ($cached as $key => $value) {
-            $value = self::formatValue($value);
+            $scale = (int)($metrics[$key]['scale'] ?? 1);
+            $value = $scale > 1 && is_int($value) ? self::formatFixedPoint($value, $scale) : self::formatValue($value);
             $groupKey = "# TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
             $metricGrouped[$groupKey][] = "{$metrics[$key]['name']} {$value}";
         }
@@ -230,6 +313,19 @@ class prometheusMetrics
         }
 
         return $response;
+    }
+
+    protected static function formatFixedPoint(int $value, int $scale): string
+    {
+        $sign = $value < 0 ? '-' : '';
+        $value = abs($value);
+        $fraction = $value % $scale;
+        if ($fraction === 0) {
+            return $sign . intdiv($value, $scale);
+        }
+        $digits = strlen((string)($scale - 1));
+
+        return $sign . intdiv($value, $scale) . '.' . rtrim(str_pad((string)$fraction, $digits, '0', STR_PAD_LEFT), '0');
     }
 
     /**
