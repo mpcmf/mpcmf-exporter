@@ -160,8 +160,8 @@ class prometheusMetrics
 
         $metricGrouped = [];
         foreach ($cached as $key => $value) {
-            $value = (float)($value);
-            $groupKey = "#TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
+            $value = self::formatValue($value);
+            $groupKey = "# TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
             $metricGrouped[$groupKey][] = "{$metrics[$key]['name']} {$value}";
         }
 
@@ -170,6 +170,53 @@ class prometheusMetrics
         }
 
         return $response;
+    }
+
+    /**
+     * Format a sample value for the text exposition format: +Inf/-Inf/NaN, integers without ".0",
+     * fractions in plain notation where the exponent is small.
+     *
+     * @param int|float|string|bool|null $value
+     */
+    protected static function formatValue($value): string
+    {
+        if (is_int($value)) {
+            return (string)$value;
+        }
+        $value = (float)$value;
+        if (is_nan($value)) {
+            return 'NaN';
+        }
+        if (is_infinite($value)) {
+            return $value > 0 ? '+Inf' : '-Inf';
+        }
+        // shortest round-trip representation, e.g. "3.0", "0.1", "1.0E-7"
+        $repr = var_export($value, true);
+        $ePos = strpos($repr, 'E');
+        if ($ePos !== false) {
+            $exponent = (int)substr($repr, $ePos + 1);
+            if (abs($exponent) > 30) {
+                return $repr;
+            }
+            $sign = $repr[0] === '-' ? '-' : '';
+            $mantissa = ltrim(substr($repr, 0, $ePos), '-');
+            $digits = str_replace('.', '', $mantissa);
+            $point = strpos($mantissa, '.');
+            $point = ($point === false ? strlen($mantissa) : $point) + $exponent;
+            if ($point <= 0) {
+                $repr = '0.' . str_repeat('0', -$point) . $digits;
+            } elseif ($point >= strlen($digits)) {
+                $repr = $digits . str_repeat('0', $point - strlen($digits));
+            } else {
+                $repr = substr($digits, 0, $point) . '.' . substr($digits, $point);
+            }
+            $repr = $sign . $repr;
+        }
+        if (strpos($repr, '.') !== false) {
+            $repr = rtrim(rtrim($repr, '0'), '.');
+        }
+
+        return $repr === '-0' ? '0' : $repr;
     }
 
     protected static function coll(): \MongoCollection
