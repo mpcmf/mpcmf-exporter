@@ -35,6 +35,12 @@ class prometheusMetrics
     /** Max age of values buffered by incrementCounterCached(), seconds */
     protected const CACHED_FLUSH_INTERVAL = 10;
 
+    /** Lifetime of a registration marker: a lost registry document is restored within this period */
+    protected const REGISTRATION_EXPIRE = 86400;
+
+    /** Delay before a process retries a failed registration, seconds */
+    protected const REGISTRATION_RETRY_INTERVAL = 30;
+
     use log;
 
     /** @var array series cache key => [metric, series name, buffered value] */
@@ -44,6 +50,12 @@ class prometheusMetrics
     protected static $cachedCountersPid;
 
     protected static $cachedCountersFlushedAt = 0;
+
+    /** @var array value key => time until which the series is known to be registered */
+    protected static $registered = [];
+
+    /** @var array value key => time of the next registration attempt after a failure */
+    protected static $registrationRetryAt = [];
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
@@ -127,10 +139,10 @@ class prometheusMetrics
 
         $mcKey = self::buildCacheKey($key, $name);
         $cache = self::cache();
-        if($cache->get($mcKey) === false) {
-            self::saveName($key, $name, 'gauge');
-        }
         $cache->set($mcKey, $value, self::CACHE_EXPIRE);
+        self::ensureRegistered($mcKey, static function () use ($key, $name) {
+            return self::saveName($key, $name, 'gauge');
+        });
     }
 
     /**
@@ -166,17 +178,20 @@ class prometheusMetrics
 
         $expire = self::counterExpire($name);
         $countKey = self::buildCacheKey("{$name}_count", $countName);
-        if (self::atomicIncrement($countKey, self::VALUE_SCALE, $expire) === true) {
-            self::registerHistogram($name, $labels, $buckets, $countKey);
-        }
+        self::atomicIncrement($countKey, self::VALUE_SCALE, $expire);
+        self::ensureRegistered($countKey, static function () use ($name, $labels, $buckets, $countKey) {
+            return self::registerHistogram($name, $labels, $buckets, $countKey);
+        });
 
         $bucketLabels = $labels;
         $bucketLabels['le'] = $activeBucket;
         $bucketName = self::formatNameWithLabels("{$name}_bucket", $bucketLabels);
-        if (self::atomicIncrement(self::buildCacheKey("{$name}_bucket", $bucketName), self::VALUE_SCALE, $expire) === true) {
-            // covers buckets added to an existing histogram
-            self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $activeBucket);
-        }
+        $bucketKey = self::buildCacheKey("{$name}_bucket", $bucketName);
+        self::atomicIncrement($bucketKey, self::VALUE_SCALE, $expire);
+        // covers buckets added to an existing histogram
+        self::ensureRegistered($bucketKey, static function () use ($name, $bucketLabels, $countKey, $activeBucket) {
+            return self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $activeBucket);
+        });
 
         $sumName = self::formatNameWithLabels("{$name}_sum", $labels);
         self::atomicIncrement(self::buildCacheKey("{$name}_sum", $sumName), $sumDelta, $expire);
@@ -209,7 +224,7 @@ class prometheusMetrics
     /**
      * Register every bucket of a new series, so unobserved buckets are exposed as well.
      */
-    protected static function registerHistogram(string $name, array $labels, array $buckets, string $countKey): void
+    protected static function registerHistogram(string $name, array $labels, array $buckets, string $countKey): bool
     {
         $bounds = [];
         foreach ($buckets as $bucket) {
@@ -219,20 +234,23 @@ class prometheusMetrics
         foreach ($bounds as $le) {
             $bucketLabels = $labels;
             $bucketLabels['le'] = $le;
-            self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $le);
+            if (!self::saveHistogramPart($name, 'bucket', $bucketLabels, $countKey, $le)) {
+                return false;
+            }
         }
-        self::saveHistogramPart($name, 'sum', $labels, $countKey);
-        self::saveHistogramPart($name, 'count', $labels, $countKey);
+
+        return self::saveHistogramPart($name, 'sum', $labels, $countKey)
+            && self::saveHistogramPart($name, 'count', $labels, $countKey);
     }
 
-    protected static function saveHistogramPart(string $name, string $part, array $labels, string $countKey, ?string $le = null): void
+    protected static function saveHistogramPart(string $name, string $part, array $labels, string $countKey, ?string $le = null): bool
     {
         $key = "{$name}_{$part}";
         $extra = ['family' => $name, 'part' => $part, 'group' => $countKey];
         if ($le !== null) {
             $extra['le'] = $le;
         }
-        self::saveName($key, self::formatNameWithLabels($key, $labels), 'histogram', $extra);
+        return self::saveName($key, self::formatNameWithLabels($key, $labels), 'histogram', $extra);
     }
 
     /**
@@ -244,9 +262,47 @@ class prometheusMetrics
         if ($delta === null) {
             return;
         }
-        if (self::atomicIncrement(self::buildCacheKey($key, $name), $delta, self::counterExpire($key)) === true) {
-            self::saveName($key, $name, 'counter');
+        $mcKey = self::buildCacheKey($key, $name);
+        self::atomicIncrement($mcKey, $delta, self::counterExpire($key));
+        self::ensureRegistered($mcKey, static function () use ($key, $name) {
+            return self::saveName($key, $name, 'counter');
+        });
+    }
+
+    /**
+     * Register a series in the registry once per REGISTRATION_EXPIRE across all processes.
+     * Registration is tracked by a separate marker key, never by the value key: a failed
+     * registration drops only the marker and is retried, the value keeps counting.
+     */
+    protected static function ensureRegistered(string $mcKey, callable $register): void
+    {
+        $now = time();
+        if ((self::$registered[$mcKey] ?? 0) > $now || (self::$registrationRetryAt[$mcKey] ?? 0) > $now) {
+            return;
         }
+        $memcached = self::cache()->getBackend();
+        $markerKey = self::KEY_PREFIX . 'reg:' . substr($mcKey, strlen(self::KEY_PREFIX));
+        if (!$memcached->add($markerKey, 1, self::REGISTRATION_EXPIRE)) {
+            if ($memcached->getResultCode() === \Memcached::RES_NOTSTORED) {
+                // registered by another process or call
+                self::$registered[$mcKey] = $now + self::REGISTRATION_EXPIRE;
+                unset(self::$registrationRetryAt[$mcKey]);
+
+                return;
+            }
+            self::logBackendError("add {$markerKey}: {$memcached->getResultMessage()}");
+            self::$registrationRetryAt[$mcKey] = $now + self::REGISTRATION_RETRY_INTERVAL;
+
+            return;
+        }
+        if ($register()) {
+            self::$registered[$mcKey] = $now + self::REGISTRATION_EXPIRE;
+            unset(self::$registrationRetryAt[$mcKey]);
+
+            return;
+        }
+        $memcached->delete($markerKey);
+        self::$registrationRetryAt[$mcKey] = $now + self::REGISTRATION_RETRY_INTERVAL;
     }
 
     /**
@@ -387,7 +443,10 @@ class prometheusMetrics
         return "{$key}{{$labelsStr}}";
     }
 
-    protected static function saveName(string $key, string $name, string $type, array $extra = []): void
+    /**
+     * @return bool false if the registry is unavailable: the series stays unregistered
+     */
+    protected static function saveName(string $key, string $name, string $type, array $extra = []): bool
     {
         try {
             $newObj = [
@@ -401,7 +460,13 @@ class prometheusMetrics
             self::coll()->insert($newObj);
         } catch (\MongoDuplicateKeyException $e) {
             //pass
+        } catch (\Throwable $e) {
+            self::logBackendError("register {$name}: {$e->getMessage()}");
+
+            return false;
         }
+
+        return true;
     }
 
     protected static function buildCacheKey(string $key, string $name): string
