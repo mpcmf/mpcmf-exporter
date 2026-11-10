@@ -48,6 +48,9 @@ class prometheusMetrics
     /** Delay before a process retries a failed registration, seconds */
     protected const REGISTRATION_RETRY_INTERVAL = 30;
 
+    /** Gauge on every page: 1 if values could not be read from memcached, the page is then incomplete or empty */
+    protected const SCRAPE_ERROR_METRIC = 'mpcmf_exporter_scrape_error';
+
     /** errno of a write to a connection the server has closed (EPIPE on Linux) */
     protected const ERRNO_BROKEN_PIPE = 32;
 
@@ -555,9 +558,15 @@ class prometheusMetrics
         }
 
         $cached = [];
+        $readError = false;
         $chunked = array_chunk(array_keys($metrics), 5000, true);
         foreach ($chunked as $chunk) {
-            $cachedChunk = self::backendCall($cache->getBackend(), true, 'getMulti', $chunk);
+            $memcached = $cache->getBackend();
+            $cachedChunk = self::backendCall($memcached, true, 'getMulti', $chunk);
+            if (!is_array($cachedChunk) || $memcached->getResultCode() === \Memcached::RES_SOME_ERRORS) {
+                $readError = true;
+                self::logBackendError("getMulti of " . count($chunk) . " keys: {$memcached->getResultMessage()}");
+            }
             if (!is_array($cachedChunk)) {
                 continue;
             }
@@ -565,9 +574,14 @@ class prometheusMetrics
         }
         unset($chunked, $chunk, $cachedChunk);
 
+        // a failed read is reported in the page itself: the caller builds the HTTP response,
+        // and an exception would also drop whatever the caller adds to the page
+        $errorLine = '# TYPE ' . self::SCRAPE_ERROR_METRIC . " gauge\n"
+            . self::formatNameWithLabels(self::SCRAPE_ERROR_METRIC, []) . ' ' . ($readError ? 1 : 0) . "\n";
+
         if(empty($cached)) {
 
-            return $response;
+            return $errorLine;
         }
 
         $families = [];
@@ -597,7 +611,7 @@ class prometheusMetrics
             $response .= "# TYPE {$family} {$data['type']}\n" . implode("\n", $data['lines']) . "\n";
         }
 
-        return $response;
+        return $response . $errorLine;
     }
 
     /**
