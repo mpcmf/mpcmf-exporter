@@ -410,12 +410,20 @@ class prometheusMetrics
 
     protected static function logInvalid(string $message): void
     {
+        self::logOnce("{$message}, metric skipped");
+    }
+
+    /**
+     * Log a warning once per process
+     */
+    protected static function logOnce(string $message): void
+    {
         static $logged = [];
         if (isset($logged[$message]) || count($logged) >= 1000) {
             return;
         }
         $logged[$message] = true;
-        self::log()->addWarning("[prometheusMetrics] {$message}, metric skipped");
+        self::log()->addWarning("[prometheusMetrics] {$message}");
     }
 
     protected static function escapeLabelValue(string $value): string
@@ -573,14 +581,17 @@ class prometheusMetrics
         return $lines;
     }
 
+    /**
+     * A name used with several types (e.g. setGauge() and incrementCounter() with different labels)
+     * is exposed as one untyped family: a name may have only one # TYPE, and dropping a type hides its series.
+     */
     protected static function addFamilyLines(array &$families, string $family, string $type, array $lines): void
     {
         if (!isset($families[$family])) {
             $families[$family] = ['type' => $type, 'lines' => []];
-        } elseif ($families[$family]['type'] !== $type) {
-            self::logInvalid("metric {$family} is registered as both {$families[$family]['type']} and {$type}");
-
-            return;
+        } elseif ($families[$family]['type'] !== $type && $families[$family]['type'] !== 'untyped') {
+            self::logOnce("metric {$family} is registered as both {$families[$family]['type']} and {$type}, exposed as untyped");
+            $families[$family]['type'] = 'untyped';
         }
         array_push($families[$family]['lines'], ...$lines);
     }
