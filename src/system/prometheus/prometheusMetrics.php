@@ -11,27 +11,30 @@ use mpcmf\system\storage\mongoInstance;
 class prometheusMetrics
 {
 
-    /** TTL of gauges, refreshed by every setGauge() */
+    /**
+     * TTL of gauges, seconds
+     */
     protected const CACHE_EXPIRE = 86400;
 
     /**
-     * Lifetime of counter keys (30 days, the largest relative memcached TTL).
-     * increment() does not extend the TTL, so a counter restarts from zero once per period.
+     * TTL of counter keys, not extended by increment()
      */
     protected const COUNTER_EXPIRE = 2592000;
 
-    /** Counters are stored as integers in millionths: increment() accepts integers only */
+    /**
+     * Counters are stored as integers in millionths
+     */
     protected const VALUE_SCALE = 1000000;
 
-    /** Key prefix and registry version of the integer storage format; older float keys are left to expire */
+    /**
+     * Key prefix of the integer storage format
+     */
     protected const KEY_PREFIX = 'v2:';
 
     protected const FORMAT_VERSION = 2;
 
     /**
-     * Suffix of the registry collection of this format. An older exporter reads every document of its collection
-     * and prints the values as they are: with the v2 documents there it would show v2 series ×VALUE_SCALE
-     * next to its own ones. A separate collection keeps old and new versions apart during a rollout or a rollback.
+     * Registry collection suffix of this format
      */
     protected const REGISTRY_SUFFIX = '_v2';
 
@@ -39,35 +42,61 @@ class prometheusMetrics
 
     protected const LABEL_NAME_REGEX = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
 
-    /** Max age of values buffered by incrementCounterCached(), seconds */
+    /**
+     * Max age of values buffered by incrementCounterCached(), seconds
+     */
     protected const CACHED_FLUSH_INTERVAL = 10;
 
-    /** Lifetime of a registration marker: a lost registry document is restored within this period */
+    /**
+     * Lifetime of a registration marker, seconds
+     */
     protected const REGISTRATION_EXPIRE = 86400;
 
-    /** Delay before a process retries a failed registration, seconds */
+    /**
+     * Delay before a failed registration is retried, seconds
+     */
     protected const REGISTRATION_RETRY_INTERVAL = 30;
 
-    /** Gauge on every page: 1 if values could not be read from memcached, the page is then incomplete or empty */
+    /**
+     * Gauge set to 1 when the values could not be read
+     */
     protected const SCRAPE_ERROR_METRIC = 'mpcmf_exporter_scrape_error';
 
-    /** errno of a write to a connection the server has closed (EPIPE on Linux) */
+    /**
+     * errno of a write to a closed connection (EPIPE)
+     */
     protected const ERRNO_BROKEN_PIPE = 32;
 
     use log;
 
-    /** @var array series cache key => [metric, series name, buffered value] */
+    /**
+     * Buffered increments: series cache key => [metric, series name, value]
+     *
+     * @var array
+     */
     protected static $cachedCounters = [];
 
-    /** @var int|null pid that owns $cachedCounters */
+    /**
+     * Pid that owns the buffered increments
+     *
+     * @var int|null
+     */
     protected static $cachedCountersPid;
 
     protected static $cachedCountersFlushedAt = 0;
 
-    /** @var array value key => time until which the series is known to be registered */
+    /**
+     * Registered series: value key => known until
+     *
+     * @var array
+     */
     protected static $registered = [];
 
-    /** @var array value key => time of the next registration attempt after a failure */
+    /**
+     * Next registration attempt by value key
+     *
+     * @var array
+     */
     protected static $registrationRetryAt = [];
 
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
@@ -81,8 +110,7 @@ class prometheusMetrics
     }
 
     /**
-     * Buffer increments in the process and write them once the buffered value reaches $incrementAfter,
-     * at least every CACHED_FLUSH_INTERVAL seconds (checked on the next call) and at process shutdown.
+     * Buffer increments, write them by threshold, by time and at shutdown
      */
     public static function incrementCounterCached(string $key, array $labels = [], $counter = 1, $incrementAfter = 10): void
     {
@@ -108,7 +136,7 @@ class prometheusMetrics
     }
 
     /**
-     * Write all values buffered by incrementCounterCached(); also runs at process shutdown.
+     * Write all buffered increments
      */
     public static function flushCachedCounters(): void
     {
@@ -127,16 +155,16 @@ class prometheusMetrics
         if (self::$cachedCountersPid === $pid) {
             return;
         }
-        // a forked child must not write what its parent buffered: the parent flushes it itself
+        // a child must not write what its parent buffered
         self::$cachedCounters = [];
         self::$cachedCountersFlushedAt = time();
         if (self::$cachedCountersPid === null) {
-            // inherited by forked children, where it flushes only their own values
+            // inherited by forked children
             register_shutdown_function(static function () {
                 try {
                     self::flushCachedCounters();
                 } catch (\Throwable $e) {
-                    self::log()->addError('[prometheusMetrics] flush of cached counters failed: ' . $e->getMessage());
+                    self::log()->addError('Flush of cached counters failed: ' . $e->getMessage(), [__CLASS__]);
                 }
             });
         }
@@ -161,8 +189,7 @@ class prometheusMetrics
     }
 
     /**
-     * Observe a value: one write to its bucket (le is inclusive), plus _count and _sum.
-     * Buckets are made cumulative in buildMetricsPage().
+     * Observe a value: its bucket, _count and _sum
      *
      * @param int|float $value
      */
@@ -213,7 +240,9 @@ class prometheusMetrics
     }
 
     /**
-     * @return array|null bucket bounds sorted ascending, without +Inf
+     * Bucket bounds sorted ascending, without +Inf
+     *
+     * @return array|null
      */
     protected static function normalizeBuckets(string $name, array $buckets): ?array
     {
@@ -237,7 +266,7 @@ class prometheusMetrics
     }
 
     /**
-     * Register every bucket of a new series, so unobserved buckets are exposed as well.
+     * Register every bucket of a new series
      */
     protected static function registerHistogram(string $name, array $labels, array $buckets, string $countKey): bool
     {
@@ -286,9 +315,7 @@ class prometheusMetrics
     }
 
     /**
-     * Register a series in the registry once per REGISTRATION_EXPIRE across all processes.
-     * Registration is tracked by a separate marker key, never by the value key: a failed
-     * registration drops only the marker and is retried, the value keeps counting.
+     * Register a series once per REGISTRATION_EXPIRE by a marker key
      */
     protected static function ensureRegistered(string $mcKey, callable $register): void
     {
@@ -298,7 +325,7 @@ class prometheusMetrics
         }
         $memcached = self::cache()->getBackend();
         $markerKey = self::KEY_PREFIX . 'reg:' . substr($mcKey, strlen(self::KEY_PREFIX));
-        // not repeated after a lost reply: a repeated add() would see its own marker and skip the registration
+        // a repeated add() would skip the registration
         if (!self::backendCall($memcached, false, 'add', $markerKey, 1, self::REGISTRATION_EXPIRE)) {
             if ($memcached->getResultCode() === \Memcached::RES_NOTSTORED) {
                 // registered by another process or call
@@ -337,10 +364,9 @@ class prometheusMetrics
     }
 
     /**
-     * Add $delta to an integer key: increment(), or add() + increment() when the key is missing.
-     * CAS is not used on purpose: memcached-protocol backends such as dragonfly do not support it.
+     * Add $delta to an integer key without CAS
      *
-     * @return bool|null true if this call created the key, false if the key existed, null on error
+     * @return bool|null true if created, null on error
      */
     protected static function atomicIncrement(string $mcKey, int $delta, int $expire): ?bool
     {
@@ -348,13 +374,13 @@ class prometheusMetrics
         if (self::backendCall($memcached, false, 'increment', $mcKey, $delta) !== false) {
             return false;
         }
-        // false is "not found" only with RES_NOTFOUND; anything else is a backend error
+        // false without RES_NOTFOUND is a backend error
         if ($memcached->getResultCode() !== \Memcached::RES_NOTFOUND) {
             self::logBackendError("increment {$mcKey}: {$memcached->getResultMessage()}");
 
             return null;
         }
-        // adding 0 twice is harmless: a repeated add() of an applied one returns RES_NOTSTORED
+        // a repeated add() of 0 is harmless
         $created = self::backendCall($memcached, true, 'add', $mcKey, 0, $expire);
         if (!$created && $memcached->getResultCode() !== \Memcached::RES_NOTSTORED) {
             self::logBackendError("add {$mcKey}: {$memcached->getResultMessage()}");
@@ -371,17 +397,7 @@ class prometheusMetrics
     }
 
     /**
-     * Call the backend, once more if the call failed on a broken connection.
-     *
-     * The exporter uses the \Memcached object of the core wrapper directly. A forked child that exits or
-     * reconnects the wrapper frees its inherited copy of that object, and libmemcached sends "quit" over the
-     * socket shared with the parent: the server closes the parent's connection. The parent's next request fails
-     * (EPIPE), libmemcached drops the connection and the next request reconnects.
-     *
-     * increment() is not idempotent, so a call with $idempotent = false is repeated only when the request
-     * provably did not reach the server: the write failed, and the server executes a text-protocol command
-     * only after its final "\r\n", which is in the failed write. A failed read is not repeated: the request
-     * may have been executed and only the reply lost.
+     * Call the backend, once more after a broken connection
      *
      * @return mixed
      */
@@ -419,8 +435,7 @@ class prometheusMetrics
     }
 
     /**
-     * All keys of one metric expire at the same moment (the phase depends on the metric name),
-     * so histogram buckets, _sum and _count always restart together.
+     * Same expiry moment for all keys of a metric
      */
     protected static function counterExpire(string $family): int
     {
@@ -436,14 +451,13 @@ class prometheusMetrics
             return;
         }
         $suffix = $suppressed > 0 ? " ({$suppressed} more errors suppressed)" : '';
-        self::log()->addError("[prometheusMetrics] {$message}{$suffix}");
+        self::log()->addError("{$message}{$suffix}", [__CLASS__]);
         $lastLogged = time();
         $suppressed = 0;
     }
 
     /**
-     * Validate the metric and label names and build the series name.
-     * Returns null (and logs) when the series cannot be exposed: one bad line breaks the whole scrape.
+     * Validated series name, null if it cannot be exposed
      */
     protected static function buildSeriesName(string $key, array $labels): ?string
     {
@@ -488,7 +502,7 @@ class prometheusMetrics
             return;
         }
         $logged[$message] = true;
-        self::log()->addWarning("[prometheusMetrics] {$message}");
+        self::log()->addWarning($message, [__CLASS__]);
     }
 
     protected static function escapeLabelValue(string $value): string
@@ -518,7 +532,9 @@ class prometheusMetrics
     }
 
     /**
-     * @return bool false if the registry is unavailable: the series stays unregistered
+     * Save the series to the registry
+     *
+     * @return bool
      */
     protected static function saveName(string $key, string $name, string $type, array $extra = []): bool
     {
@@ -574,8 +590,7 @@ class prometheusMetrics
         }
         unset($chunked, $chunk, $cachedChunk);
 
-        // a failed read is reported in the page itself: the caller builds the HTTP response,
-        // and an exception would also drop whatever the caller adds to the page
+        // report a failed read in the page itself
         $errorLine = '# TYPE ' . self::SCRAPE_ERROR_METRIC . " gauge\n"
             . self::formatNameWithLabels(self::SCRAPE_ERROR_METRIC, []) . ' ' . ($readError ? 1 : 0) . "\n";
 
@@ -598,7 +613,7 @@ class prometheusMetrics
         }
         foreach ($histograms as $family => $groups) {
             foreach ($groups as $countKey => $parts) {
-                // _count expired: the whole series restarts, buckets must not outlive it
+                // _count expired: the whole series restarts
                 if (!array_key_exists($countKey, $cached)) {
                     continue;
                 }
@@ -615,7 +630,7 @@ class prometheusMetrics
     }
 
     /**
-     * Cumulative buckets sorted by le, +Inf equal to _count, then _sum and _count.
+     * Cumulative buckets, then _sum and _count
      */
     protected static function buildHistogramLines(array $parts, array $cached): array
     {
@@ -658,8 +673,7 @@ class prometheusMetrics
     }
 
     /**
-     * A name used with several types (e.g. setGauge() and incrementCounter() with different labels)
-     * is exposed as one untyped family: a name may have only one # TYPE, and dropping a type hides its series.
+     * Expose a name used with several types as one untyped family
      */
     protected static function addFamilyLines(array &$families, string $family, string $type, array $lines): void
     {
@@ -696,8 +710,7 @@ class prometheusMetrics
     }
 
     /**
-     * Format a sample value for the text exposition format: +Inf/-Inf/NaN, integers without ".0",
-     * fractions in plain notation where the exponent is small.
+     * Sample value in the text exposition format
      *
      * @param int|float|string|bool|null $value
      */
@@ -713,7 +726,7 @@ class prometheusMetrics
         if (is_infinite($value)) {
             return $value > 0 ? '+Inf' : '-Inf';
         }
-        // shortest round-trip representation, e.g. "3.0", "0.1", "1.0E-7"
+        // shortest round-trip representation
         $repr = var_export($value, true);
         $ePos = strpos($repr, 'E');
         if ($ePos !== false) {
