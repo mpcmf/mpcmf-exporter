@@ -13,5 +13,5 @@
 ## notes
 
 - Metric names must match `[a-zA-Z_:][a-zA-Z0-9_:]*`, label names `[a-zA-Z_][a-zA-Z0-9_]*`, label values must be valid UTF-8; invalid series are logged and skipped.
-- Counters and histograms are incremented atomically and stored as integers in millionths (6 decimal places).
+- Counters and histograms are incremented atomically and stored as integers in millionths (6 decimal places) under `v2:` keys; the series registry is the configured collection with the suffix `_v2` (e.g. `prometheus.metrics_v2`), so an older version of the library, which reads the configured collection, never sees them.
 - Counter keys live 30 days and then restart from zero (a counter reset for `rate()`); gauges expire 24 hours after the last update.

@@ -28,6 +28,13 @@ class prometheusMetrics
 
     protected const FORMAT_VERSION = 2;
 
+    /**
+     * Suffix of the registry collection of this format. An older exporter reads every document of its collection
+     * and prints the values as they are: with the v2 documents there it would show v2 series ×VALUE_SCALE
+     * next to its own ones. A separate collection keeps old and new versions apart during a rollout or a rollback.
+     */
+    protected const REGISTRY_SUFFIX = '_v2';
+
     protected const METRIC_NAME_REGEX = '/^[a-zA-Z_:][a-zA-Z0-9_:]*$/D';
 
     protected const LABEL_NAME_REGEX = '/^[a-zA-Z_][a-zA-Z0-9_]*$/D';
@@ -726,6 +733,7 @@ class prometheusMetrics
         static $mongo, $config;
         if ($mongo === null) {
             $config = config::getConfig(__CLASS__)['storage'];
+            $config['collection'] .= self::REGISTRY_SUFFIX;
             $mongo = mongoInstance::factory($config['configSection']);
             $mongo->checkIndicesAuto($config);
         }
