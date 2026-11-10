@@ -250,6 +250,7 @@ class prometheusMetrics
         if ($le !== null) {
             $extra['le'] = $le;
         }
+
         return self::saveName($key, self::formatNameWithLabels($key, $labels), 'histogram', $extra);
     }
 
