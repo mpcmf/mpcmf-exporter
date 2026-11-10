@@ -41,6 +41,9 @@ class prometheusMetrics
     /** Delay before a process retries a failed registration, seconds */
     protected const REGISTRATION_RETRY_INTERVAL = 30;
 
+    /** errno of a write to a connection the server has closed (EPIPE on Linux) */
+    protected const ERRNO_BROKEN_PIPE = 32;
+
     use log;
 
     /** @var array series cache key => [metric, series name, buffered value] */
@@ -138,8 +141,10 @@ class prometheusMetrics
         }
 
         $mcKey = self::buildCacheKey($key, $name);
-        $cache = self::cache();
-        $cache->set($mcKey, $value, self::CACHE_EXPIRE);
+        $memcached = self::cache()->getBackend();
+        if (!self::backendCall($memcached, true, 'set', $mcKey, $value, self::CACHE_EXPIRE)) {
+            self::logBackendError("set {$mcKey}: {$memcached->getResultMessage()}");
+        }
         self::ensureRegistered($mcKey, static function () use ($key, $name) {
             return self::saveName($key, $name, 'gauge');
         });
@@ -283,7 +288,8 @@ class prometheusMetrics
         }
         $memcached = self::cache()->getBackend();
         $markerKey = self::KEY_PREFIX . 'reg:' . substr($mcKey, strlen(self::KEY_PREFIX));
-        if (!$memcached->add($markerKey, 1, self::REGISTRATION_EXPIRE)) {
+        // not repeated after a lost reply: a repeated add() would see its own marker and skip the registration
+        if (!self::backendCall($memcached, false, 'add', $markerKey, 1, self::REGISTRATION_EXPIRE)) {
             if ($memcached->getResultCode() === \Memcached::RES_NOTSTORED) {
                 // registered by another process or call
                 self::$registered[$mcKey] = $now + self::REGISTRATION_EXPIRE;
@@ -302,7 +308,7 @@ class prometheusMetrics
 
             return;
         }
-        $memcached->delete($markerKey);
+        self::backendCall($memcached, true, 'delete', $markerKey);
         self::$registrationRetryAt[$mcKey] = $now + self::REGISTRATION_RETRY_INTERVAL;
     }
 
@@ -329,7 +335,7 @@ class prometheusMetrics
     protected static function atomicIncrement(string $mcKey, int $delta, int $expire): ?bool
     {
         $memcached = self::cache()->getBackend();
-        if ($memcached->increment($mcKey, $delta) !== false) {
+        if (self::backendCall($memcached, false, 'increment', $mcKey, $delta) !== false) {
             return false;
         }
         // false is "not found" only with RES_NOTFOUND; anything else is a backend error
@@ -338,19 +344,68 @@ class prometheusMetrics
 
             return null;
         }
-        $created = $memcached->add($mcKey, 0, $expire);
+        // adding 0 twice is harmless: a repeated add() of an applied one returns RES_NOTSTORED
+        $created = self::backendCall($memcached, true, 'add', $mcKey, 0, $expire);
         if (!$created && $memcached->getResultCode() !== \Memcached::RES_NOTSTORED) {
             self::logBackendError("add {$mcKey}: {$memcached->getResultMessage()}");
 
             return null;
         }
-        if ($memcached->increment($mcKey, $delta) === false) {
+        if (self::backendCall($memcached, false, 'increment', $mcKey, $delta) === false) {
             self::logBackendError("increment {$mcKey}: {$memcached->getResultMessage()}");
 
             return $created ?: null;
         }
 
         return $created;
+    }
+
+    /**
+     * Call the backend, once more if the call failed on a broken connection.
+     *
+     * The exporter uses the \Memcached object of the core wrapper directly. A forked child that exits or
+     * reconnects the wrapper frees its inherited copy of that object, and libmemcached sends "quit" over the
+     * socket shared with the parent: the server closes the parent's connection. The parent's next request fails
+     * (EPIPE), libmemcached drops the connection and the next request reconnects.
+     *
+     * increment() is not idempotent, so a call with $idempotent = false is repeated only when the request
+     * provably did not reach the server: the write failed, and the server executes a text-protocol command
+     * only after its final "\r\n", which is in the failed write. A failed read is not repeated: the request
+     * may have been executed and only the reply lost.
+     *
+     * @return mixed
+     */
+    protected static function backendCall(\Memcached $memcached, bool $idempotent, string $method, ...$arguments)
+    {
+        $result = $memcached->{$method}(...$arguments);
+        if ($result === false && self::isBrokenConnection($memcached, $idempotent)) {
+            $result = $memcached->{$method}(...$arguments);
+        }
+
+        return $result;
+    }
+
+    protected static function isBrokenConnection(\Memcached $memcached, bool $anyConnectionError): bool
+    {
+        $code = $memcached->getResultCode();
+        if ($code === \Memcached::RES_WRITE_FAILURE) {
+            return true;
+        }
+        if ($code === \Memcached::RES_ERRNO && method_exists($memcached, 'getLastErrorErrno')
+            && $memcached->getLastErrorErrno() === self::ERRNO_BROKEN_PIPE) {
+            return true;
+        }
+        if (!$anyConnectionError) {
+            return false;
+        }
+
+        return in_array($code, [
+            \Memcached::RES_FAILURE,
+            \Memcached::RES_ERRNO,
+            \Memcached::RES_CONNECTION_FAILURE,
+            \Memcached::RES_READ_FAILURE,
+            \Memcached::RES_UNKNOWN_READ_FAILURE,
+        ], true);
     }
 
     /**
@@ -495,7 +550,7 @@ class prometheusMetrics
         $cached = [];
         $chunked = array_chunk(array_keys($metrics), 5000, true);
         foreach ($chunked as $chunk) {
-            $cachedChunk = $cache->getBackend()->getMulti($chunk);
+            $cachedChunk = self::backendCall($cache->getBackend(), true, 'getMulti', $chunk);
             if (!is_array($cachedChunk)) {
                 continue;
             }
