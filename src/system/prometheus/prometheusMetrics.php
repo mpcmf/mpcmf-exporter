@@ -34,6 +34,26 @@ class prometheusMetrics
     protected const FORMAT_VERSION = 2;
 
     /**
+     * Format of the master branch: get + set floats, no key prefix
+     */
+    protected const LEGACY_FORMAT_VERSION = 1;
+
+    /**
+     * TTL of format 1 keys, seconds
+     */
+    protected const LEGACY_EXPIRE = 86400;
+
+    /**
+     * Page format if the config has no key format
+     */
+    protected const DEFAULT_PAGE_FORMAT = 1;
+
+    /**
+     * Format 1 writes if the config has no key write_legacy
+     */
+    protected const DEFAULT_WRITE_LEGACY = true;
+
+    /**
      * Registry collection suffix of this format
      */
     protected const REGISTRY_SUFFIX = '_v2';
@@ -99,6 +119,13 @@ class prometheusMetrics
      */
     protected static $registrationRetryAt = [];
 
+    /**
+     * Next format 1 write of an unregistered key
+     *
+     * @var array
+     */
+    protected static $legacyRetryAt = [];
+
     public static function incrementCounter(string $key, array $labels = [], $counter = 1): void
     {
         $name = self::buildSeriesName($key, $labels);
@@ -106,7 +133,7 @@ class prometheusMetrics
             return;
         }
 
-        self::addToCounter($key, $name, $counter);
+        self::addToCounter($key, $name, $counter, [[$labels, $counter]]);
     }
 
     /**
@@ -122,13 +149,20 @@ class prometheusMetrics
 
         $mcKey = self::buildCacheKey($key, $name);
         if (!isset(self::$cachedCounters[$mcKey])) {
-            self::$cachedCounters[$mcKey] = [$key, $name, 0];
+            self::$cachedCounters[$mcKey] = [$key, $name, 0, []];
         }
         self::$cachedCounters[$mcKey][2] += $counter;
+        if (self::isLegacyWritten()) {
+            // format 1 series depend on the label order
+            $legacyName = self::formatLegacyName($key, $labels);
+            $part = self::$cachedCounters[$mcKey][3][$legacyName] ?? [$labels, 0];
+            $part[1] += $counter;
+            self::$cachedCounters[$mcKey][3][$legacyName] = $part;
+        }
         if (self::$cachedCounters[$mcKey][2] >= $incrementAfter) {
-            $value = self::$cachedCounters[$mcKey][2];
+            [, , $value, $legacy] = self::$cachedCounters[$mcKey];
             unset(self::$cachedCounters[$mcKey]);
-            self::addToCounter($key, $name, $value);
+            self::addToCounter($key, $name, $value, $legacy);
         }
         if (time() - self::$cachedCountersFlushedAt >= self::CACHED_FLUSH_INTERVAL) {
             self::flushCachedCounters();
@@ -144,8 +178,8 @@ class prometheusMetrics
         $counters = self::$cachedCounters;
         self::$cachedCounters = [];
         self::$cachedCountersFlushedAt = time();
-        foreach ($counters as [$key, $name, $value]) {
-            self::addToCounter($key, $name, $value);
+        foreach ($counters as [$key, $name, $value, $legacy]) {
+            self::addToCounter($key, $name, $value, $legacy);
         }
     }
 
@@ -178,6 +212,8 @@ class prometheusMetrics
             return;
         }
 
+        self::legacySetGauge($key, $labels, $value);
+
         $mcKey = self::buildCacheKey($key, $name);
         $memcached = self::cache()->getBackend();
         if (!self::backendCall($memcached, true, 'set', $mcKey, $value, self::CACHE_EXPIRE)) {
@@ -205,13 +241,14 @@ class prometheusMetrics
             return;
         }
         $sumDelta = self::toFixedPoint($name, $value);
-        $buckets = self::normalizeBuckets($name, $buckets);
-        if ($sumDelta === null || $buckets === null) {
+        $bounds = self::normalizeBuckets($name, $buckets);
+        if ($sumDelta === null || $bounds === null) {
             return;
         }
+        self::legacyHistogram($name, $labels, $buckets, $value);
 
         $activeBucket = '+Inf';
-        foreach ($buckets as $bucket) {
+        foreach ($bounds as $bucket) {
             if ($value <= $bucket) {
                 $activeBucket = self::formatValue($bucket);
                 break;
@@ -221,8 +258,8 @@ class prometheusMetrics
         $expire = self::counterExpire($name);
         $countKey = self::buildCacheKey("{$name}_count", $countName);
         self::atomicIncrement($countKey, self::VALUE_SCALE, $expire);
-        self::ensureRegistered($countKey, static function () use ($name, $labels, $buckets, $countKey) {
-            return self::registerHistogram($name, $labels, $buckets, $countKey);
+        self::ensureRegistered($countKey, static function () use ($name, $labels, $bounds, $countKey) {
+            return self::registerHistogram($name, $labels, $bounds, $countKey);
         });
 
         $bucketLabels = $labels;
@@ -300,12 +337,16 @@ class prometheusMetrics
 
     /**
      * @param int|float $counter
+     * @param array $legacy format 1 parts: [labels, value]
      */
-    protected static function addToCounter(string $key, string $name, $counter): void
+    protected static function addToCounter(string $key, string $name, $counter, array $legacy): void
     {
         $delta = self::toFixedPoint($key, $counter);
         if ($delta === null) {
             return;
+        }
+        foreach ($legacy as [$labels, $value]) {
+            self::legacyIncrement($key, $labels, $value);
         }
         $mcKey = self::buildCacheKey($key, $name);
         self::atomicIncrement($mcKey, $delta, self::counterExpire($key));
@@ -566,6 +607,9 @@ class prometheusMetrics
 
     public static function buildMetricsPage(): string
     {
+        if (self::settings()['format'] === self::LEGACY_FORMAT_VERSION) {
+            return self::buildLegacyMetricsPage();
+        }
         $cache = self::cache();
         $response = '';
         $metrics = [];
@@ -753,6 +797,239 @@ class prometheusMetrics
         }
 
         return $repr === '-0' ? '0' : $repr;
+    }
+
+    /**
+     * Page format and format 1 writes from the config
+     *
+     * @return array
+     */
+    protected static function settings(): array
+    {
+        static $settings;
+        if ($settings === null) {
+            $config = config::getConfig(__CLASS__);
+            $format = (int)($config['format'] ?? self::DEFAULT_PAGE_FORMAT);
+            if ($format !== self::LEGACY_FORMAT_VERSION && $format !== self::FORMAT_VERSION) {
+                self::logOnce("unknown page format {$format}, format " . self::DEFAULT_PAGE_FORMAT . ' used');
+                $format = self::DEFAULT_PAGE_FORMAT;
+            }
+            $settings = [
+                'format' => $format,
+                'write_legacy' => (bool)($config['write_legacy'] ?? self::DEFAULT_WRITE_LEGACY),
+            ];
+        }
+
+        return $settings;
+    }
+
+    protected static function isLegacyWritten(): bool
+    {
+        return self::settings()['write_legacy'];
+    }
+
+    /**
+     * Add to a format 1 counter like master: get + set
+     *
+     * @param int|float $counter
+     */
+    protected static function legacyIncrement(string $key, array $labels, $counter): void
+    {
+        if (!self::isLegacyWritten()) {
+            return;
+        }
+        try {
+            $name = self::formatLegacyName($key, $labels);
+            $mcKey = "{$key}_" . md5($name);
+            $cache = self::cache();
+            $cv = $cache->get($mcKey);
+            if ($cv === false) {
+                // a read error must not reset the counter
+                if ($cache->getBackend()->getResultCode() !== \Memcached::RES_NOTFOUND) {
+                    self::logBackendError("legacy get {$mcKey}: {$cache->getBackend()->getResultMessage()}");
+
+                    return;
+                }
+                if (!self::legacySaveName($key, $name, $mcKey, 'counter')) {
+                    return;
+                }
+                $cv = $counter;
+            } else {
+                $cv += $counter;
+            }
+            self::legacySet($mcKey, $cv);
+        } catch (\Throwable $e) {
+            self::logBackendError("legacy write {$key}: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * @param mixed $value
+     */
+    protected static function legacySetGauge(string $key, array $labels, $value): void
+    {
+        if (!self::isLegacyWritten()) {
+            return;
+        }
+        try {
+            $name = self::formatLegacyName($key, $labels);
+            $mcKey = "{$key}_" . md5($name);
+            if (self::cache()->get($mcKey) === false && !self::legacySaveName($key, $name, $mcKey, 'gauge')) {
+                return;
+            }
+            self::legacySet($mcKey, $value);
+        } catch (\Throwable $e) {
+            self::logBackendError("legacy write {$key}: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Non-cumulative format 1 buckets, strict le and int value like master
+     *
+     * @param int|float $value
+     */
+    protected static function legacyHistogram(string $name, array $labels, array $buckets, $value): void
+    {
+        if (!self::isLegacyWritten()) {
+            return;
+        }
+        $value = (int)$value;
+        $activeBucket = '+Inf';
+        foreach ($buckets as $bucket) {
+            if ($value < $bucket) {
+                $activeBucket = $bucket;
+                break;
+            }
+        }
+        $bucketLabels = $labels;
+        $bucketLabels['le'] = $activeBucket;
+        self::legacyIncrement("{$name}_bucket", $bucketLabels, 1);
+        self::legacyIncrement("{$name}_count", $labels, 1);
+        self::legacyIncrement("{$name}_sum", $labels, $value);
+    }
+
+    /**
+     * @param mixed $value
+     */
+    protected static function legacySet(string $mcKey, $value): void
+    {
+        $cache = self::cache();
+        if (!$cache->set($mcKey, $value, self::LEGACY_EXPIRE)) {
+            self::logBackendError("legacy set {$mcKey}: {$cache->getBackend()->getResultMessage()}");
+        }
+    }
+
+    /**
+     * Save a series to the format 1 registry, false to skip the write
+     */
+    protected static function legacySaveName(string $key, string $name, string $mcKey, string $type): bool
+    {
+        if ((self::$legacyRetryAt[$mcKey] ?? 0) > time()) {
+            return false;
+        }
+        try {
+            $newObj = [
+                'key' => $key,
+                'name' => $name,
+                'type' => $type,
+                'cache_key' => $mcKey,
+            ];
+            self::legacyColl()->insert($newObj);
+        } catch (\MongoDuplicateKeyException $e) {
+            //pass
+        } catch (\Throwable $e) {
+            self::logBackendError("legacy register {$name}: {$e->getMessage()}");
+            // the key stays absent, so the next write registers it
+            self::$legacyRetryAt[$mcKey] = time() + self::REGISTRATION_RETRY_INTERVAL;
+
+            return false;
+        }
+        unset(self::$legacyRetryAt[$mcKey]);
+
+        return true;
+    }
+
+    /**
+     * Series name of format 1: env first, labels in call order, not escaped
+     */
+    protected static function formatLegacyName(string $key, array $labels): string
+    {
+        static $systemData;
+        if ($systemData === null) {
+            $systemData = [
+                'env' => environment::getCurrentEnvironment(),
+            ];
+        }
+
+        $labelData = [];
+        foreach ($systemData as $label => $labelValue) {
+            $labelData[$label] = "{$label}=\"{$labelValue}\"";
+        }
+        foreach ($labels as $label => $labelValue) {
+            $labelData[$label] = "{$label}=\"{$labelValue}\"";
+        }
+        $labelsStr = implode(', ', $labelData);
+
+        return "{$key}{{$labelsStr}}";
+    }
+
+    /**
+     * Page of format 1, the same as master builds
+     */
+    protected static function buildLegacyMetricsPage(): string
+    {
+        if (!self::isLegacyWritten()) {
+            self::logOnce('page format 1 with write_legacy off shows only series of older versions');
+        }
+        $cache = self::cache();
+        $response = '';
+        $metrics = [];
+        foreach (self::legacyColl()->find() as $metric) {
+            $metrics[$metric['cache_key']] = $metric;
+        }
+
+        $cached = [];
+        $chunked = array_chunk(array_keys($metrics), 5000, true);
+        foreach ($chunked as $chunk) {
+            $memcached = $cache->getBackend();
+            $cachedChunk = self::backendCall($memcached, true, 'getMulti', $chunk);
+            if (!is_array($cachedChunk)) {
+                self::logBackendError("legacy getMulti of " . count($chunk) . " keys: {$memcached->getResultMessage()}");
+                continue;
+            }
+            $cached = array_merge($cached, $cachedChunk);
+        }
+        unset($chunked, $chunk, $cachedChunk);
+
+        if (empty($cached)) {
+
+            return $response;
+        }
+
+        $metricGrouped = [];
+        foreach ($cached as $key => $value) {
+            $value = (float)($value);
+            $groupKey = "#TYPE {$metrics[$key]['key']} {$metrics[$key]['type']}";
+            $metricGrouped[$groupKey][] = "{$metrics[$key]['name']} {$value}";
+        }
+
+        foreach ($metricGrouped as $groupKey => $groupMetrics) {
+            $response .= $groupKey . "\n" . implode("\n", $groupMetrics) . "\n";
+        }
+
+        return $response;
+    }
+
+    protected static function legacyColl(): \MongoCollection
+    {
+        static $mongo, $config;
+        if ($mongo === null) {
+            $config = config::getConfig(__CLASS__)['storage'];
+            $mongo = mongoInstance::factory($config['configSection']);
+            $mongo->checkIndicesAuto($config);
+        }
+
+        return $mongo->getCollection($config['db'], $config['collection']);
     }
 
     protected static function coll(): \MongoCollection
