@@ -19,3 +19,20 @@
 - Counters hold at most `PHP_INT_MAX` millionths, about 9.22e12 per key lifetime (30 days). Beyond that dragonfly rejects the increment (logged, the value stops growing until the key expires); plain memcached wraps around. Count large quantities in larger units (e.g. kilobytes instead of bytes).
 - All keys of a metric expire together, but memcached/dragonfly may evict single keys under memory pressure. An evicted histogram `_count` hides the series; when it is recreated while its buckets survive, the buckets exceed `_count` until the metric's keys expire. Keep the cache below its memory limit.
 - A forked child that frees its inherited memcached connection closes it for the parent too. The next request of the parent fails with a broken pipe and is repeated once on a new connection; increments are repeated only when the failure is a write failure, i.e. the request did not reach the server.
+
+## transition from format 1 to 2
+
+Format 1 is the format of master (keys `<key>_<md5>`, `get` + `set`, TTL 24 h, registry `prometheus.metrics`, non-cumulative buckets), format 2 is described above. Two config keys of `mpcmf\system\prometheus\prometheusMetrics` control the transition:
+
+- `format` — `1` (default): `buildMetricsPage()` builds the master page from the format 1 keys and registry; `2`: the format 2 page.
+- `write_legacy` — `true` (default): every write also goes to format 1 exactly as master does it; `false`: format 2 only.
+
+Steps:
+
+1. Roll out this version with `format = 1`, `write_legacy = true`. Old and new processes write format 1 together, every `/metrics` page shows full sums (format 1 is not atomic: concurrent increments are lost as on master); format 2 counts in parallel since each process update.
+2. When no process runs the old version, set `format = 2` on the processes that serve `/metrics`. Counters reset once (`rate()` handles it); histograms become `histogram` type with cumulative buckets and inclusive `le`, update dashboards and alerts at this step. Rollback: `format = 1`.
+3. Set `write_legacy = false` on all processes. Format 1 keys expire in 24 h, `prometheus.metrics` can be dropped afterwards.
+
+While `write_legacy` is on, a counter increment makes 3 memcached requests instead of 1, a gauge 3 instead of 1, a histogram observation 9 instead of 3. A failed write of one format is logged and does not affect the other. Both keys are read once per process, so a change applies after a restart.
+
+Set the keys in the application's `config.default.d/mpcmf_system_prometheus_prometheusMetrics.php`: that file replaces the package file entirely, so it must also contain `storage` and `cache`; a file without the new keys gets the defaults (`1`, `true`). Environment-specific values go through `config::setConfig(__FILE__, [...], '<environment>')` in the same file, with the full config for that environment.
